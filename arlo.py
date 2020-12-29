@@ -16,8 +16,9 @@ limitations under the License.
 
 # 14 Sep 2016, Len Shustek: Added Logout()
 # 17 Jul 2017, Andreas Jakl: Port to Python 3 (https://www.andreasjakl.com/using-netgear-arlo-security-cameras-for-periodic-recording/)
-# 26 Mar 2019, Michael Urspringer: Changed Authentication API to new version and added some code for 2FA (not yet complete!)
-#              Did not yet change all requests, but only the requests I am currently using!
+# 2021-01-05, thomaswitt added MFA, based on:
+#             https://github.com/twratl/arlo-mfa-aws &
+#             https://github.com/m0urs/arlo-cl
 
 # Import helper classes that are part of this library.
 from request import Request
@@ -29,15 +30,17 @@ from datetime import datetime
 
 import calendar
 import json
-# import logging
+#import logging
 import math
 import os
 import random
-import requests
+import requests as standard_requests
 import signal
 import time
 import sys
 import base64
+import re
+from dateutil import parser
 
 if sys.version[0] == '2':
     import Queue as queue
@@ -48,7 +51,8 @@ else:
 
 class Arlo(object):
     TRANSID_PREFIX = 'web'
-    def __init__(self, username, password):
+    def __init__(self, username, password,
+        mfa_prestage_url=None, mfa_prestage_api_key=None):
 
         # signals only work in main thread
         try:
@@ -56,10 +60,18 @@ class Arlo(object):
         except:
             pass
 
-        self.event_streams = {}
+        self.event_stream = None
         self.request = None
 
-        self.Login(username, password)
+        self.headers = {
+            'Referer': 'https://my.arlo.com/',
+            'Auth-Version': '2',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:74.0) Gecko/20100101 Firefox/74.0',
+            'Content-Type': 'application/json;charset=utf-8',
+            'schemaVersion': '1'
+        }
+
+        self.Login(username, password, mfa_prestage_url, mfa_prestage_api_key)
 
     def interrupt_handler(self, signum, frame):
         print("Caught Ctrl-C, exiting.")
@@ -108,87 +120,108 @@ class Arlo(object):
         now = datetime.today()
         return trans_type+"!" + float2hex(random.random() * math.pow(2, 32)).lower() + "!" + str(int((time.mktime(now.timetuple())*1e3 + now.microsecond/1e3)))
 
-    def createHeaders(self,token=""):
-        # Creates the Header variables needed for the HTTP requests
-        headers = {
-                    'Referer': 'https://my.arlo.com/',
-                    'Auth-Version': '2',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:74.0) Gecko/20100101 Firefox/74.0',
-				    'Content-Type': 'application/json;charset=utf-8',
-                    'schemaVersion': '1'
-        }
-        if token != "":
-            headers['Authorization'] = token
-        return headers
-
-    def Login(self, username, password):
-
+    def Login(self, username, password, mfa_prestage_url=None, mfa_prestage_api_key=None):
         """
-        This call returns the following:
+        This sessions call returns the following:
         {
-            'userId': 'XXXXX-XXX-XXXXXXXX',
-            'email': 'user@example.com',
-            'token': '2_oJ0aXXXXXXXXXX_Jcgdk6ulwT0XXXXXXXXXXLmRpaYTYVq6BEz3B5kZ35HBXXXXXXXXXX4vt6H7dsoK0fTwTUXvaExQyDJelSDEc41XXXXXXXXXXlHWGYrP86Lc3JacV-36Kp2XXXXXXXXXXON5grYgj68cgMIGX1kDE00HabvVR-xu0XxdG1oRqnl5UXXXXXXXXXXX8EyJAmqD7zrmhpgWbSBqilOCJWF7Et8dBtkkKo7sn-XZXXXXXXXXXXi4g1kQXzHMIxyXmz6WsjonKfB2h8PP8tLVzLxmn5s9GqRsTD_d4nU8iU72M0wS-3Wh0njoFtybC1jfwF2XXXXXXXXXX',
-            'accountStatus': 'registered',
-            'countryCode': 'DE',
-            'tocUpdate': False,
-            'policyUpdate': False,
-            'validEmail': True,
-            'arlo': True,
-            'dateCreated': 1545374127585,
-            'mailProgramChecked': True
+            "userId":"XXX-XXXXXXX",
+            "email":"user@example.com",
+            "token":"TOKEN_FOR_NEXT_CALLS",
+            "paymentId":"123456789",
+            "accountStatus":"registered",
+            "serialNumber":"XXXXXXXXXXXXX",
+            "countryCode":"DE",
+            "tocUpdate":false,
+            "policyUpdate":false,
+            "validEmail":true
+            "arlo":true
+            "dateCreated":EPOCH_13_DIGITS
+            "mailProgramChecked": true
         }
-        
         """
-
         self.username = username
         self.password = password
+        self.mfa_prestage_url = mfa_prestage_url ### MFA
+        self.mfa_prestage_api_key = mfa_prestage_api_key ### MFA
 
         self.request = Request()
 
-        # Get authorization token
-        body = self.request.post('https://ocapi-app.arlo.com/api/auth', {'email': self.username, 'password': self.password, "language":"de","EnvSource":"prod"}, self.createHeaders())
+        # Returns
+        # {"_type": "AccessTokenV2", "token": "2_TOKEN", "userId": "UUID", "authenticated": EPOCH_10_DIGITS, "issued": EPOCH_10_DIGITS, "expiresIn": EPOCH_10_DIGITS, "mfa": true, "authCompleted": false, "type": "USER", "MFA_State": "ENABLED"}
+        body = self.request.post('https://ocapi-app.arlo.com/api/auth',
+            {'email': self.username, 'password': self.password,
+                "language":"de","EnvSource":"prod"}, headers=self.headers)
+
         token = body['token']
         token_base64 = str(base64.b64encode(token.encode("utf-8")), "utf-8")
+        self.headers['Authorization'] = token_base64
 
-        # Check if 2FA enabled
-        if body["mfa"]:
-        
-            # Get a list of all valid two factors
-            body = self.request.get('https://ocapi-app.arlo.com/api/getFactors?data%20=%20'+str(body['authenticated']), {}, self.createHeaders(token_base64))
-            twofactors_list = body['items']
-    
-            # Get the two factor ID for SMS
-            twofactor_id = list(filter(lambda twofactors_list: twofactors_list['factorType'] == 'SMS', twofactors_list))[0]['factorId']
+        if body["mfa"] and self.mfa_prestage_url and self.mfa_prestage_api_key:
+           # Returns: {"_type": "_Collection", "items": [{"_type": "SecondFactor", "factorId": "B64_HASH", "factorType": "SMS", "displayName": "16661234578", "factorNickname": "16661234578", "applicationId": "UUID", "applicationName": "Generic", "factorRole": "PRIMARY"}], "MFA_State": "ENABLED"}
+           # B64 decoded: PingIdSDK:SMS:00000000-0000-0000-0000-000000000000:00000000-0000-0000-0000-000000000000
+            body = self.request.get(
+                'https://ocapi-app.arlo.com/api/getFactors?data%20=%20' \
+                    + str(body['authenticated']), headers=self.headers)
+            factors = body['items']
 
-            # Get the SMS with the 2nd factor
-            body = self.request.post('https://ocapi-app.arlo.com/api/startAuth', {"factorId" : twofactor_id}, self.createHeaders(token_base64))
+            factor = list(filter(lambda factors: factors['factorType'] == 'SMS', factors))[0]
+            sms_number = factor['displayName'] # SMS 2FA receipient number
 
-            # Wait for keyboard input of the secod factor value (this is just sample code!)
-            otp = input("OTP? ")
+            # Returns: {"_type": "FactorAuthCode", "factorAuthCode": "B64_HASH", "MFA_State": "ENABLED"}
+            # Decoded: PingIdSDK:SMS:webs_000000-000-00-000-000000000:00000-000-000-000-000000000
+            body = self.request.post(
+                'https://ocapi-app.arlo.com/api/startAuth',
+                {"factorId": factor['factorId']}, headers=self.headers)
 
-            # Finish 2FA and get new authorization token
-            body = self.request.post('https://ocapi-app.arlo.com/api/finishAuth', {"factorAuthCode" : body['factorAuthCode'], "otp" : otp }, self.createHeaders(token_base64))
+            # Fetching the code from AWS Pinpoint via the AWS Lambda Function
+            while True:
+                mfa_response = standard_requests.post(
+                    self.mfa_prestage_url,
+                    headers = {'x-api-key': self.mfa_prestage_api_key}
+                ).json()
+                date = parser.parse("{}".format(mfa_response['message_timestamp']))
+                seconds_diff = (datetime.utcnow() - date).total_seconds()
+                if (seconds_diff < 5 and re.search("Arlo",
+                                                mfa_response['message_body'])):
+                    break
+                else:
+                    time.sleep(1)
+            # SMS content: Der Arlo Authentifizierungscode lautet 000000.
+            # TODO: Validate
+            otp = re.search("\d{6}", mfa_response['message_body']).group(0)
+            if otp == "":
+              sys.stderr.write("Wrong/no otp token: {}".format(otp))
+              sys.stderr.write("SMS content was {}".format(mfa_response['message_body']))
+
+            # Result (contains new token): {"expiresIn": EPOCH_10_DIGITS, "mfa": true, "_type": "AccessTokenV2", "authenticated": EPOCH_10_DIGITS, "issued": EPOCH_10_DIGITS, "userId": "0000000-000-00000000", "token": "NEW_TOKEN_FOR_FURTHER_REQUESTS", "authCompleted": true, "MFA_State": "ENABLED"}
+            body = self.request.post(
+                'https://ocapi-app.arlo.com/api/finishAuth',
+                {"factorAuthCode": body['factorAuthCode'], "otp": otp},
+                headers=self.headers)
+
             token = body['token']
             token_base64 = str(base64.b64encode(token.encode("utf-8")), "utf-8")
+            self.headers['Authorization'] = token_base64
+        else:
+          print('No MFA required')
 
-        # Verifiy authorization token
-        body = self.request.get('https://ocapi-app.arlo.com/api/validateAccessToken?data = {}'.format(int(time.time())), {}, self.createHeaders(token_base64))
+        # Result: {"_type": "User", "_id": "0000000-000-00000000", "firstName": "John", "lastName": "Doe", "country": "DE", "language": "de", "acceptedPolicy": 1, "currentPolicy": 1, "emailConfirmed": true, "email": "user@example.com", "mfa": true, "interactions": {"mfaDeniedTimestamp": EPOCH_10_DIGITS, "mfaRemindersEnabled": false, "serverTime": EPOCH_10_DIGITS}, "mfaSetup": "NOT_REQUIRED", "MFA_State": "ENABLED", "tokenValidated": true}
+        body = self.request.get('https://ocapi-app.arlo.com/api/validateAccessToken?data = {}'.format(int(time.time())), {}, headers=self.headers)
 
-        # Open session
-        body = self.request.get('https://my.arlo.com/hmsweb/users/session/v2', {}, self.createHeaders(token))
+        self.headers['Authorization'] = token
+        self.request.session.headers.update(self.headers)
+
+        # Open session, result see at top
+        body = self.request.get('https://my.arlo.com/hmsweb/users/session/v2',
+            {}, headers=self.headers)
 
         self.user_id = body['userId']
-        self.token = body['token']
-        self.headers = self.createHeaders(token)
-
         return body
 
     def Logout(self):
-        event_streams = self.event_streams.copy()
-        for basestation_id in event_streams.keys():
-            self.Unsubscribe(basestation_id)
-        return self.request.put('https://my.arlo.com/hmsweb/logout', {}, self.createHeaders(self.token))
+        self.Unsubscribe()
+        time.sleep(2)
+        return self.request.put('https://my.arlo.com/hmsweb/logout', headers=self.headers)
 
     def Subscribe(self, basestation):
         """
@@ -209,13 +242,13 @@ class Arlo(object):
         basestation_id = basestation.get('deviceId')
 
         def Register(self):
-            if basestation_id in self.event_streams and self.event_streams[basestation_id].connected:
+            if self.event_stream and self.event_stream.connected and not self.event_stream.registered:
                 self.Notify(basestation, {"action":"set","resource":"subscriptions/"+self.user_id+"_web","publishResponse":False,"properties":{"devices":[basestation_id]}})
-                event = self.event_streams[basestation_id].Get()
-                if event is None or self.event_streams[basestation_id].event_stream_stop_event.is_set():
+                event = self.event_stream.Get()
+                if event is None or self.event_stream.event_stream_stop_event.is_set():
                     return None
                 elif event:
-                    self.event_streams[basestation_id].Register()
+                    self.event_stream.Register()
                 return event
 
         def QueueEvents(self, event_stream, stop_event):
@@ -224,15 +257,14 @@ class Arlo(object):
                     return None
 
                 response = json.loads(event.data)
-                if basestation_id in self.event_streams:
-                    if self.event_streams[basestation_id].connected:
-                        if response.get('action') == 'logout':
-                            self.event_streams[basestation_id].Disconnect()
-                            return None
-                        else:
-                            self.event_streams[basestation_id].queue.put(response)
-                    elif response.get('status') == 'connected':
-                        self.event_streams[basestation_id].Connect()
+                if self.event_stream and self.event_stream.connected:
+                    if response.get('action') == 'logout':
+                        self.event_stream.Disconnect()
+                        return None
+                    else:
+                        self.event_stream.queue.put(response)
+                elif response.get('status') == 'connected':
+                    self.event_stream.Connect()
 
         def Heartbeat(self, stop_event):
             while not stop_event.wait(30.0):
@@ -241,27 +273,22 @@ class Arlo(object):
                 except:
                     pass
 
-        if basestation_id not in self.event_streams or not self.event_streams[basestation_id].connected:
-            self.event_streams[basestation_id] = EventStream(QueueEvents, Heartbeat, args=(self, ))
-            self.event_streams[basestation_id].Start()
-            while not self.event_streams[basestation_id].connected and not self.event_streams[basestation_id].event_stream_stop_event.is_set():
+        if not self.event_stream or not self.event_stream.connected:
+            self.event_stream = EventStream(QueueEvents, Heartbeat, args=(self, ))
+            self.event_stream.Start()
+            while not self.event_stream.connected and not self.event_stream.event_stream_stop_event.is_set():
                 time.sleep(0.5)
 
-        if not self.event_streams[basestation_id].registered:
+        if not self.event_stream.registered:
             Register(self)
 
-    def Unsubscribe(self, basestation):
+    def Unsubscribe(self):
         """ This method stops the EventStream subscription and removes it from the event_stream collection. """
-        if isinstance(basestation, (text_type, string_types)):
-            basestation_id = basestation
-        else:
-            basestation_id = basestation.get('deviceId')
-        if basestation_id in self.event_streams:
-            if self.event_streams[basestation_id].connected:
-                self.request.get('https://my.arlo.com/hmsweb/client/unsubscribe')
-                self.event_streams[basestation_id].Disconnect()
+        if self.event_stream and self.event_stream.connected:
+            self.request.get('https://my.arlo.com/hmsweb/client/unsubscribe')
+            self.event_stream.Disconnect()
 
-            del self.event_streams[basestation_id]
+        self.event_stream = None
 
     def Notify(self, basestation, body):
         """
@@ -309,30 +336,29 @@ class Arlo(object):
         body['from'] = self.user_id+'_web'
         body['to'] = basestation_id
 
-        self.headers["xcloudId"] = basestation.get('xCloudId')
-        self.request.post('https://my.arlo.com/hmsweb/users/devices/notify/'+body['to'], body, headers=self.headers)
+        self.request.post('https://my.arlo.com/hmsweb/users/devices/notify/'+body['to'], body, headers={"xcloudId":basestation.get('xCloudId')})
         return body.get('transId')
 
-    def NotifyAndGetResponse(self, basestation, body, timeout=120):
+    def NotifyAndGetResponse(self, basestation, body, timeout=10):
         basestation_id = basestation.get('deviceId')
 
         self.Subscribe(basestation)
 
-        if basestation_id in self.event_streams and self.event_streams[basestation_id].connected and self.event_streams[basestation_id].registered:
+        if self.event_stream and self.event_stream.connected and self.event_stream.registered:
             transId = self.Notify(basestation, body)
 
-            event = self.event_streams[basestation_id].Get(timeout=timeout)
-            if event is None or self.event_streams[basestation_id].event_stream_stop_event.is_set():
+            event = self.event_stream.Get(timeout=timeout)
+            if event is None or self.event_stream.event_stream_stop_event.is_set():
                 return None
 
-            while basestation_id in self.event_streams and self.event_streams[basestation_id].connected and self.event_streams[basestation_id].registered:
+            while self.event_stream.connected and self.event_stream.registered:
                 tid = event.get('transId', '')
                 if tid != transId:
                     if tid.startswith(self.TRANSID_PREFIX):
-                        self.event_streams[basestation_id].queue.put(event)
+                        self.event_stream.queue.put(event)
 
-                    event = self.event_streams[basestation_id].Get(timeout=timeout)
-                    if event is None or self.event_streams[basestation_id].event_stream_stop_event.is_set():
+                    event = self.event_stream.Get(timeout=timeout)
+                    if event is None or self.event_stream.event_stream_stop_event.is_set():
                         return None
                 else: break
 
@@ -369,17 +395,17 @@ class Arlo(object):
         basestation_id = basestation.get('deviceId')
 
         self.Subscribe(basestation)
-        if basestation_id in self.event_streams and self.event_streams[basestation_id].connected and self.event_streams[basestation_id].registered:
-            while basestation_id in self.event_streams and self.event_streams[basestation_id].connected:
-                event = self.event_streams[basestation_id].Get(timeout=timeout)
-                if event is None or self.event_streams[basestation_id].event_stream_stop_event.is_set():
+        if self.event_stream and self.event_stream.connected and self.event_stream.registered:
+            while self.event_stream.connected:
+                event = self.event_stream.Get(timeout=timeout)
+                if event is None or self.event_stream.event_stream_stop_event.is_set():
                     return None
 
                 # If this event has is of resource type "subscriptions", then it's a ping reply event.
                 # For now, these types of events will be requeued, since they are generated in response to and expected as a reply by the Ping() method.
                 # HACK: Take a quick nap here to give the Ping() method's thread a chance to get the queued event.
                 if event.get('resource', '').startswith('subscriptions'):
-                    self.event_streams[basestation_id].queue.put(event)
+                    self.event_stream.queue.put(event)
                     time.sleep(0.05)
                 else:
                     response = callback(self, event)
@@ -437,7 +463,7 @@ class Arlo(object):
         return self.request.post('https://my.arlo.com/hmsweb/users/devices/'+camera.get('uniqueId')+'/activityzones', {"name": zone,"coords": coords, "color": color})
 
     def GetAutomationDefinitions(self):
-        return self.request.get('https://my.arlo.com/hmsweb/users/automation/definitions', {'uniqueIds':'all'},self.headers)
+        return self.request.get('https://my.arlo.com/hmsweb/users/automation/definitions', {'uniqueIds':'all'})
 
     def GetCalendar(self, basestation):
         return self.NotifyAndGetResponse(basestation, {"action":"get","resource":"schedule","publishResponse":False})
@@ -448,7 +474,7 @@ class Arlo(object):
         if device['deviceType'] == 'arlobridge':
             return self.request.delete('https://my.arlo.com/hmsweb/users/locations/'+device.get('uniqueId')+'/modes/'+mode)
         elif not parentId or device.get('deviceId') == parentId:
-            return self.NotifyAndGetResponse(basestation, {"action":"delete","resource":"modes/"+mode,"publishResponse":True})
+            return self.NotifyAndGetResponse(device, {"action":"delete","resource":"modes/"+mode,"publishResponse":True})
         else:
             raise Exception('Only parent device modes and schedules can be deleted.');
 
@@ -469,7 +495,7 @@ class Arlo(object):
         if(device["deviceType"].startswith("arloq")):
             return self.NotifyAndGetResponse(device, {"from":self.user_id+"_web", "to": device.get("parentId"), "action":"set","resource":"modes", "transId": self.genTransId(),"publishResponse":True,"properties":{"active":mode}})
         else:
-            return self.request.post('https://my.arlo.com/hmsweb/users/devices/automation/active', {'activeAutomations':[{'deviceId':device.get('deviceId'),'timestamp':self.to_timestamp(datetime.now()),'activeModes':[mode],'activeSchedules':schedules}]},self.headers)
+            return self.request.post('https://my.arlo.com/hmsweb/users/devices/automation/active', {'activeAutomations':[{'deviceId':device.get('deviceId'),'timestamp':self.to_timestamp(datetime.now()),'activeModes':[mode],'activeSchedules':schedules}]})
 
     def Arm(self, device):
         return self.CustomMode(device, "mode1")
@@ -601,7 +627,7 @@ class Arlo(object):
           "transId": "web!XXXXXXXX.389518!1514956240683"
         }
         """
-        return self.NotifyAndGetResponse(basestation, {"action":"set","resource":"cameras/"+camera.get('deviceId'),"publishResponse":True,"properties":{"brightness":brightness}},self.headers)
+        return self.NotifyAndGetResponse(basestation, {"action":"set","resource":"cameras/"+camera.get('deviceId'),"publishResponse":True,"properties":{"brightness":brightness}})
 
     def ToggleCamera(self, basestation, camera, active=True):
         """
@@ -635,7 +661,9 @@ class Arlo(object):
         return self.NotifyAndGetResponse(basestation, {"action":"get","resource":"audioPlayback","publishResponse":False})
 
     def PlayTrack(self, basestation, track_id="2391d620-e491-4412-99f6-e9a40d6046ed", position=0):
-        """ Defaulting to 'hugh little baby', which is a supplied track. I hope the ID is the same for all. """
+        """
+        Defaulting to 'hugh little baby', which is a supplied track. I hope the ID is the same for all
+        """
         return self.Notify(basestation, {"action":"playTrack","resource":"audioPlayback/player","properties":{"trackId":track_id,"position":position}})
 
     def PauseTrack(self, basestation):
@@ -643,7 +671,7 @@ class Arlo(object):
 
     def UnPauseTrack(self, basestation):
         return self.Notify(basestation, {"action":"play","resource":"audioPlayback/player"})
-   
+
     def SkipTrack(self, basestation):
         return self.Notify(basestation, {"action":"nextTrack","resource":"audioPlayback/player"})
 
@@ -809,7 +837,74 @@ class Arlo(object):
         return self.request.get('https://my.arlo.com/hmsweb/users/ocprofile')
 
     def GetProfile(self):
+        """
+        This call returns the following:
+        {
+          "data": {
+              "_type": "User",
+              "firstName": "Joe",
+              "lastName": "Bloggs",
+              "language": "en",
+              "country": "GB",
+              "acceptedPolicy": 1,
+              "currentPolicy": 1,
+              "validEmail": true
+          },
+          "success": true
+        }
+        """
         return self.request.get('https://my.arlo.com/hmsweb/users/profile')
+
+    def GetAccount(self):
+        """
+        This call returns the following:
+        {
+          "data": {
+            "userId": "XXX-XXXXXXX",
+            "email": "joe.bloggs@gmail.com",
+            "dateCreated": 1585157000819,
+            "dateDeviceRegistered": 1585161139527,
+            "countryCode": "GB",
+            "language": "en-gb",
+            "firstName": "Joe",
+            "lastName": "Bloggs",
+            "s3StorageId": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "tosVersion": "5",
+            "tosAgreeDate": 1593126066795,
+            "tosShownVersion": "5",
+            "lastModified": 1585161137898,
+            "accountStatus": "registered",
+            "paymentId": "xxxxxxxx",
+            "serialNumber": "xxxxxxxxxxxxx",
+            "mobilePushData": {
+                "mobilePushOsMap": {
+                    "android": [
+                        {
+                            "token": "xxxxxxxxxxxxxxxxxxx",
+                            "endpoint": "arn:aws:sns:eu-west-1:xxxxxxxxxxxx:endpoint/GCM/Arlo_Android_Prod/xxxxxxxxxxxxxxxxxxxxxx",
+                            "createdDate": "20201310_0622",
+                            "iosDebugModeFlag": false
+                        },
+                        {
+                            "token": "xxxxxxxxxxxxxxxxxxxx",
+                            "endpoint": "arn:aws:sns:eu-west-1:xxxxxxxxxxxx:endpoint/GCM/Arlo_Android_Prod/xxxxxxxxxxxxxxxxxxxxxxx",
+                            "createdDate": "20210801_0335",
+                            "iosDebugModeFlag": false
+                        }
+                    ]
+                }
+            },
+            "recycleBinQuota": 0,
+            "favoriteQuota": 0,
+            "validEmail": true,
+            "locationCreated": false,
+            "readyToClose": false,
+            "lastMessageTimeToBS": 1608375685602
+          },
+          "success": true
+        }
+        """
+        return self.request.get('https://my.arlo.com/hmsweb/users/account')
 
     def GetSession(self):
         """
@@ -873,13 +968,18 @@ class Arlo(object):
         """
         return self.request.put('https://my.arlo.com/hmsweb/users/locations/'+location_id, {'geoEnabled':active})
 
+    def GetDevice(self, device_name):
+        def is_device(device):
+            return device['deviceName'] == device_name
+        return list(filter(is_device, self.GetDevices()))[0]
+
     def GetDevices(self, device_type=None, filter_provisioned=None):
         """
         This method returns an array that contains the basestation, cameras, etc. and their metadata.
         If you pass in a valid device type, as a string or a list, this method will return an array of just those devices that match that type. An example would be ['basestation', 'camera']
-        To filter provisioned or unprovisioned devices pass in a True/False value for filter_provisioned. By default both types are returned. 
+        To filter provisioned or unprovisioned devices pass in a True/False value for filter_provisioned. By default both types are returned.
         """
-        devices = self.request.get('https://my.arlo.com/hmsweb/users/devices',{},self.headers)
+        devices = self.request.get('https://my.arlo.com/hmsweb/users/devices')
         if device_type:
             devices = [ device for device in devices if device['deviceType'] in device_type]
 
@@ -888,7 +988,7 @@ class Arlo(object):
                 devices = [ device for device in devices if device.get("state") == 'provisioned']
             else:
                 devices = [ device for device in devices if device.get("state") != 'provisioned']
-                
+
         return devices
 
     def GetDeviceSupport(self):

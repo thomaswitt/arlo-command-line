@@ -1,45 +1,36 @@
-# arlo-cl
+# arlo-command-line
 
-command line tool to control Arlo cameras. Based on Python library https://github.com/jeffreydwalter/arlo
+A command line tool to quickly turn on+arm or turn off+disarm Arlo
+cameras, e.g. to use on a Raspberry Pi with Smart Home environments. Can
+be invoked via ssh. Tested with Arlo Q cams.
 
-Uses the following Python modules:
-* requests
-* monotonic
-* sseclient
+If you'd like to call this script via ssh (e.g. via a smart home device
+like Homey), create an own user and add the following to
+`.ssh/authorized_keys`:
 
-## Purpose
+```
+command="ARLO_USERNAME=CHANGE_TO@MY-EMAIL.com; export ARLO_B64PASSWORD=0123456789ABCDEF; export ARLO_MFA_URL=https://ABCDEF.execute-api.eu-central-1.amazonaws.com/default/retrieveLatestSMS; export ARLO_MFA_API_KEY=ABCDEF; arlo-command-line/arlo-cl.py ${SSH_ORIGINAL_COMMAND}",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-rsa _YOUR_SSH_KEY_HERE_
+```
 
-This tool is specially adapted to my own environment where I am using some predefined modes to switch on / off different my different Arlo cams.
+To enable multi factor auth, you need to set up on AWS:
+- A Pinpoint project twoFactorAuth to receive SMS (long code, two-way SMS)
+- A SNS topic twoFactorAuth receiving the incoming SMS
+- A DynamoDB table twoFactorAuth (Primary partition key: message_type (string), Primary sort key: message_timestanp (number), TTL key: record_expires_at)
+- A lambda functions twoFactorAuth to push incoming SMS via SNS to DynamoDB
+- A lambda function retrieveLatestSMS to retrieve the latest SMS
+- An incoming API Gateway connecting to retrieveLatestSMS as REST (proteced by API Key in the Header)
+- IAM roles for the dynamoDB functions allowing full access to the
+  DynamoDB table twoFactorAuth and full access to the SNS topic twoFactorAuth 
 
-the script currently support these modes (which youmost likely need to adapt to your environment ...)
-
-Mode | Purpose
---- | ---
-aktiviert | Activate (Arm) all cams
-deaktiviert | Deactivate (Disarm) all cams
-aktiviert_tag | Set several custom modes for my different cams with different sensitivity during the day
-aktiviert_ohne_terrasse | Only activate some of my cams
-garten | Only activate some of my cams
-garten_hinten | Only activate some of my cams
-
-## Config
-
-The script is looking for a config file where you define the user and password for your Arlo account and the name of your base station (currently only one base station is supported).  See "arlo-cl.cfg.sample" as a sample of how the file looks like.
-
-I am using an additional account I created just to be used with this script so it does not interfere with my normal Arlo account I am using e.g. in the Arlo app.
-
-The config file is named "arlo-cl.cfg" and needs to be put in the same directory as "arlo-cl.py". You can also specifiy a different name and path for that file by adding the "--configfile" switch.
-
+The code is based on:
+Arlo Python library (https://github.com/jeffreydwalter/arlo),
+arlo-cl (https://github.com/m0urs/arlo-cl) and
+arlo-mfa-aws (https://github.com/twratl/arlo-mfa-aws)
 
 ## Usage:
 
 ```text
-usage: arlo-cl.py [-h]
-                  [--devicetype {basestation,arlobridge,camera,lights,siren}]
-                  [--devicename DEVICENAME]
-                  [--mode {aktiviert,deaktiviert,aktiviert_tag,aktiviert_ohne_terrasse,garten,garten_hinten}]
-                  [--brightness {-2,-1,0,1,2}] [--configfile CONFIGFILE]
-                  {list-devices,list-modes,get-deviceid,get-uniqueid,set-mode,set-brightness}
+usage: arlo-cl.py {list,arm,disarm}
 ```
 
 ## Samples:
@@ -52,51 +43,17 @@ arlo-cl.py list-devices
 Output:
 
 ```text
-<DEVICENAME>  :  <DEVICETYPE>  :  <DEVICEID>  :  <UNIQUE_DEVICEID>
+<DEVICENAME>  :  <DEVICETYPE>  :  <FULL SNAPSHOT URL>
 ```
 
-### List only camera devices:
+### Activate and arm all cameras
 
 ```text
-arlo-cl.py list-devices --devicetype camera
+arlo-cl.py arm
 ```
-Output:
+
+### Deactivate and disarm all cameras
 
 ```text
-<DEVICENAME>  :  <DEVICETYPE>  :  <DEVICEID>  :  <UNIQUE_DEVICEID>
+arlo-cl.py arm
 ```
-
-### List modes of devices
-
-```text
-arlo-cl.py list-modes
-```
-Output:
-
-```text
-<UNIQUE_DEVICEID>  :  <MODE_NAME>  :  <MODE_ID>  :  <MODE_TYPE> 
-```
-
-### Get Unique ID of a device named "Garten_1":
-
-```text
-arlo-cl.py get-uniqueid --devicename Garten_1
-```
-Output:
-
-```text
-<UNIQUE_DEVICEID>
-```
-
-### Set mode to "aktiviert" (arm all devices, see above)
-
-```text
-arlo-cl.py set_mode aktiviert
-```
-
-### Set brightness value for camera "CamName" to "+2"
-
-```text
-arlo-cl.py set-brightness --devicename CamName --brightness +2
-```
-
